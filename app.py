@@ -34,7 +34,6 @@ class PuLIDPipeline:
         super().__init__()
         self.device = 'cuda'
         sdxl_base_repo = 'John6666/sdxl-niji-seven-sdxl'
-        # sdxl_base_repo = '/mnt/ai213/workspace/wuyang/diffusers/models/pretrained/sdxlNijiV6_sdxlNijiV6.safetensors'
         sdxl_lightning_repo = 'ByteDance/SDXL-Lightning'
         self.sdxl_base_repo = sdxl_base_repo
 
@@ -46,11 +45,8 @@ class PuLIDPipeline:
             )
         )
         self.hack_unet_attn_layers(unet)
-        # self.pipe = StableDiffusionXLPipeline.from_pretrained(
-        #     '/mnt/ai213/workspace/wuyang/diffusers/models/pretrained/sdxlNijiV6_sdxlNijiV6.safetensors', unet=unet, torch_dtype=torch.float16, use_safetensors=True
-        # ).to(self.device)
         self.pipe = StableDiffusionXLPipeline.from_single_file(
-            '/mnt/ai213/workspace/wuyang/diffusers/models/pretrained/sdxlNijiV6_sdxlNijiV6.safetensors', unet=unet, torch_dtype=torch.float16, use_safetensors=True
+            'https://huggingface.co/oyang/ihn_simplesdxl_models/blob/main/sdxlNijiV6_sdxlNijiV6.safetensors', unet=unet, torch_dtype=torch.float16, use_safetensors=True
         )
         self.pipe.load_lora_weights("oyang/artbook-flux.1dev-lora", weight_name="rose-000020.safetensors")
         self.pipe.fuse_lora(lora_scale=0.7)
