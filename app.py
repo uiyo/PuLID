@@ -1,224 +1,235 @@
-import gradio as gr
-import numpy as np
+import gc
+
+import cv2
+import insightface
 import torch
-
-from pulid import attention_processor as attention
-from pulid.pipeline import PuLIDPipeline
-from pulid.utils import resize_numpy_image_long, seed_everything
-
-torch.set_grad_enabled(False)
-
-pipeline = PuLIDPipeline()
-
-# other params
-DEFAULT_NEGATIVE_PROMPT = (
-    'flaws in the eyes, flaws in the face, flaws, lowres, non-HDRi, low quality, worst quality,'
-    'artifacts noise, text, watermark, glitch, deformed, mutated, ugly, disfigured, hands, '
-    'low resolution, partially rendered objects,  deformed or partially rendered eyes, '
-    'deformed, deformed eyeballs, cross-eyed,blurry'
+import torch.nn as nn
+from diffusers import (
+    DPMSolverMultistepScheduler,
+    StableDiffusionXLPipeline,
+    UNet2DConditionModel,
 )
+from facexlib.parsing import init_parsing_model
+from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+from huggingface_hub import hf_hub_download, snapshot_download
+from insightface.app import FaceAnalysis
+from safetensors.torch import load_file
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import normalize, resize
+
+from eva_clip import create_model_and_transforms
+from eva_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
+from pulid.encoders import IDEncoder
+from pulid.utils import img2tensor, is_torch2_available, tensor2img
+
+if is_torch2_available():
+    from pulid.attention_processor import AttnProcessor2_0 as AttnProcessor
+    from pulid.attention_processor import IDAttnProcessor2_0 as IDAttnProcessor
+else:
+    from pulid.attention_processor import AttnProcessor, IDAttnProcessor
 
 
-def run(*args):
-    id_image = args[0]
-    supp_images = args[1:4]
-    prompt, neg_prompt, scale, n_samples, seed, steps, H, W, id_scale, mode, id_mix = args[4:]
+class PuLIDPipeline:
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.device = 'cuda'
+        sdxl_base_repo = 'John6666/sdxl-niji-seven-sdxl'
+        # sdxl_base_repo = '/mnt/ai213/workspace/wuyang/diffusers/models/pretrained/sdxlNijiV6_sdxlNijiV6.safetensors'
+        sdxl_lightning_repo = 'ByteDance/SDXL-Lightning'
+        self.sdxl_base_repo = sdxl_base_repo
 
-    pipeline.debug_img_list = []
-    if mode == 'fidelity':
-        attention.NUM_ZERO = 8
-        attention.ORTHO = False
-        attention.ORTHO_v2 = True
-    elif mode == 'extremely style':
-        attention.NUM_ZERO = 16
-        attention.ORTHO = True
-        attention.ORTHO_v2 = False
-    else:
-        raise ValueError
-
-    if id_image is not None:
-        id_image = resize_numpy_image_long(id_image, 1024)
-        id_embeddings = pipeline.get_id_embedding(id_image)
-        for supp_id_image in supp_images:
-            if supp_id_image is not None:
-                supp_id_image = resize_numpy_image_long(supp_id_image, 1024)
-                supp_id_embeddings = pipeline.get_id_embedding(supp_id_image)
-                id_embeddings = torch.cat(
-                    (id_embeddings, supp_id_embeddings if id_mix else supp_id_embeddings[:, :5]), dim=1
-                )
-    else:
-        id_embeddings = None
-
-    seed_everything(seed)
-    ims = []
-    for _ in range(n_samples):
-        img = pipeline.inference(prompt, (1, H, W), neg_prompt, id_embeddings, id_scale, scale, steps)[0]
-        ims.append(np.array(img))
-
-    return ims, pipeline.debug_img_list
-
-
-_HEADER_ = '''
-<h2><b>Official Gradio Demo</b></h2><h2><a href='https://github.com/ToTheBeginning/PuLID' target='_blank'><b>PuLID: Pure and Lightning ID Customization via Contrastive Alignment</b></a></h2>
-
-**PuLID** is a tuning-free ID customization approach. PuLID maintains high ID fidelity while effectively reducing interference with the original model’s behavior.
-
-Code: <a href='https://github.com/ToTheBeginning/PuLID' target='_blank'>GitHub</a>. Techenical report: <a href='https://arxiv.org/abs/2404.16022' target='_blank'>ArXiv</a>.
-
-❗️❗️❗️**Tips:**
-- we provide some examples in the bottom, you can try these example prompts first
-- a single ID image is usually sufficient, you can also supplement with additional auxiliary images
-- We offer two modes: fidelity mode and extremely style mode. In most cases, the default fidelity mode should suffice. If you find that the generated results are not stylized enough, you can choose the extremely style mode.
-
-'''  # noqa E501
-
-_CITE_ = r"""
-If PuLID is helpful, please help to ⭐ the <a href='https://github.com/ToTheBeginning/PuLID' target='_blank'>Github Repo</a>. Thanks! [![GitHub Stars](https://img.shields.io/github/stars/ToTheBeginning/PuLID?style=social)](https://github.com/ToTheBeginning/PuLID)
----
-🚀 **Share**
-If you have generated satisfying or interesting images with PuLID, please share them with us or your friends!
-
-📝 **Citation**
-If you find our work useful for your research or applications, please cite using this bibtex:
-```bibtex
-@article{guo2024pulid,
-  title={PuLID: Pure and Lightning ID Customization via Contrastive Alignment},
-  author={Guo, Zinan and Wu, Yanze and Chen, Zhuowei and Chen, Lang and He, Qian},
-  journal={arXiv preprint arXiv:2404.16022},
-  year={2024}
-}
-```
-
-📋 **License**
-Apache-2.0 LICENSE. Please refer to the [LICENSE file](placeholder) for details.
-
-📧 **Contact**
-If you have any questions, feel free to open a discussion or contact us at <b>wuyanze123@gmail.com</b> or <b>guozinan.1@bytedance.com</b>.
-"""  # noqa E501
-
-
-with gr.Blocks(title="PuLID", css=".gr-box {border-color: #8136e2}") as demo:
-    gr.Markdown(_HEADER_)
-    with gr.Row():
-        with gr.Column():
-            with gr.Row():
-                face_image = gr.Image(label="ID image (main)", sources="upload", type="numpy", height=256)
-                supp_image1 = gr.Image(
-                    label="Additional ID image (auxiliary)", sources="upload", type="numpy", height=256
-                )
-                supp_image2 = gr.Image(
-                    label="Additional ID image (auxiliary)", sources="upload", type="numpy", height=256
-                )
-                supp_image3 = gr.Image(
-                    label="Additional ID image (auxiliary)", sources="upload", type="numpy", height=256
-                )
-            prompt = gr.Textbox(label="Prompt", value='portrait,color,cinematic,in garden,soft light,detailed face')
-            submit = gr.Button("Generate")
-            neg_prompt = gr.Textbox(label="Negative Prompt", value=DEFAULT_NEGATIVE_PROMPT)
-            scale = gr.Slider(
-                label="CFG, recommend value range [1, 1.5], 1 will be faster ",
-                value=1.2,
-                minimum=1,
-                maximum=1.5,
-                step=0.1,
+        # load base model
+        unet = UNet2DConditionModel.from_config(sdxl_base_repo, subfolder='unet').to(self.device, torch.float16)
+        unet.load_state_dict(
+            load_file(
+                hf_hub_download(sdxl_lightning_repo, 'sdxl_lightning_4step_unet.safetensors'), device=self.device
             )
-            n_samples = gr.Slider(label="Num samples", value=4, minimum=1, maximum=8, step=1)
-            seed = gr.Slider(
-                label="Seed", value=42, minimum=np.iinfo(np.uint32).min, maximum=np.iinfo(np.uint32).max, step=1
+        )
+        self.hack_unet_attn_layers(unet)
+        # self.pipe = StableDiffusionXLPipeline.from_pretrained(
+        #     '/mnt/ai213/workspace/wuyang/diffusers/models/pretrained/sdxlNijiV6_sdxlNijiV6.safetensors', unet=unet, torch_dtype=torch.float16, use_safetensors=True
+        # ).to(self.device)
+        self.pipe = StableDiffusionXLPipeline.from_single_file(
+            '/mnt/ai213/workspace/wuyang/diffusers/models/pretrained/sdxlNijiV6_sdxlNijiV6.safetensors', unet=unet, torch_dtype=torch.float16, use_safetensors=True
+        )
+        self.pipe.load_lora_weights("oyang/artbook-flux.1dev-lora", weight_name="rose-000020.safetensors")
+        self.pipe.fuse_lora(lora_scale=0.7)
+        self.pipe.to(self.device)
+        self.pipe.watermark = None
+
+        # scheduler
+        self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            self.pipe.scheduler.config, timestep_spacing="trailing"
+        )
+
+        # ID adapters
+        self.id_adapter = IDEncoder().to(self.device)
+
+        # preprocessors
+        # face align and parsing
+        self.face_helper = FaceRestoreHelper(
+            upscale_factor=1,
+            face_size=512,
+            crop_ratio=(1, 1),
+            det_model='retinaface_resnet50',
+            save_ext='png',
+            device=self.device,
+        )
+        self.face_helper.face_parse = None
+        self.face_helper.face_parse = init_parsing_model(model_name='bisenet', device=self.device)
+        # clip-vit backbone
+        model, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', 'eva_clip', force_custom_clip=True)
+        model = model.visual
+        self.clip_vision_model = model.to(self.device)
+        eva_transform_mean = getattr(self.clip_vision_model, 'image_mean', OPENAI_DATASET_MEAN)
+        eva_transform_std = getattr(self.clip_vision_model, 'image_std', OPENAI_DATASET_STD)
+        if not isinstance(eva_transform_mean, (list, tuple)):
+            eva_transform_mean = (eva_transform_mean,) * 3
+        if not isinstance(eva_transform_std, (list, tuple)):
+            eva_transform_std = (eva_transform_std,) * 3
+        self.eva_transform_mean = eva_transform_mean
+        self.eva_transform_std = eva_transform_std
+        # antelopev2
+        snapshot_download('DIAMONIK7777/antelopev2', local_dir='models/antelopev2')
+        self.app = FaceAnalysis(
+            name='antelopev2', root='.', providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+        )
+        self.app.prepare(ctx_id=0, det_size=(640, 640))
+        self.handler_ante = insightface.model_zoo.get_model('models/antelopev2/glintr100.onnx')
+        self.handler_ante.prepare(ctx_id=0)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self.load_pretrain()
+
+        # other configs
+        self.debug_img_list = []
+
+    def hack_unet_attn_layers(self, unet):
+        id_adapter_attn_procs = {}
+        for name, _ in unet.attn_processors.items():
+            cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = unet.config.block_out_channels[block_id]
+            if cross_attention_dim is not None:
+                id_adapter_attn_procs[name] = IDAttnProcessor(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=cross_attention_dim,
+                ).to(unet.device)
+            else:
+                id_adapter_attn_procs[name] = AttnProcessor()
+        unet.set_attn_processor(id_adapter_attn_procs)
+        self.id_adapter_attn_layers = nn.ModuleList(unet.attn_processors.values())
+
+    def load_pretrain(self):
+        hf_hub_download('guozinan/PuLID', 'pulid_v1.bin', local_dir='models')
+        ckpt_path = 'models/pulid_v1.bin'
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        state_dict_dict = {}
+        for k, v in state_dict.items():
+            module = k.split('.')[0]
+            state_dict_dict.setdefault(module, {})
+            new_k = k[len(module) + 1 :]
+            state_dict_dict[module][new_k] = v
+
+        for module in state_dict_dict:
+            print(f'loading from {module}')
+            getattr(self, module).load_state_dict(state_dict_dict[module], strict=True)
+
+    def to_gray(self, img):
+        x = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+        x = x.repeat(1, 3, 1, 1)
+        return x
+
+    def get_id_embedding(self, image):
+        """
+        Args:
+            image: numpy rgb image, range [0, 255]
+        """
+        self.face_helper.clean_all()
+        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        # get antelopev2 embedding
+        face_info = self.app.get(image_bgr)
+        if len(face_info) > 0:
+            face_info = sorted(face_info, key=lambda x: (x['bbox'][2] - x['bbox'][0]) * (x['bbox'][3] - x['bbox'][1]))[
+                -1
+            ]  # only use the maximum face
+            id_ante_embedding = face_info['embedding']
+            self.debug_img_list.append(
+                image[
+                    int(face_info['bbox'][1]) : int(face_info['bbox'][3]),
+                    int(face_info['bbox'][0]) : int(face_info['bbox'][2]),
+                ]
             )
-            steps = gr.Slider(label="Steps", value=4, minimum=1, maximum=100, step=1)
-            with gr.Row():
-                H = gr.Slider(label="Height", value=1024, minimum=512, maximum=2024, step=64)
-                W = gr.Slider(label="Width", value=768, minimum=512, maximum=2024, step=64)
-            with gr.Row():
-                id_scale = gr.Slider(label="ID scale", minimum=0, maximum=5, step=0.05, value=0.8, interactive=True)
-                mode = gr.Dropdown(label="mode", choices=['fidelity', 'extremely style'], value='fidelity')
-                id_mix = gr.Checkbox(
-                    label="ID Mix (if you want to mix two ID image, please turn this on, otherwise, turn this off)",
-                    value=False,
-                )
+        else:
+            id_ante_embedding = None
 
-            gr.Markdown("## Examples")
-            example_inps = [
-                [
-                    'portrait,cinematic,wolf ears,white hair',
-                    'example_inputs/liuyifei.png',
-                    'fidelity',
-                ]
-            ]
-            gr.Examples(examples=example_inps, inputs=[prompt, face_image, mode], label='realistic')
+        # using facexlib to detect and align face
+        self.face_helper.read_image(image_bgr)
+        self.face_helper.get_face_landmarks_5(only_center_face=True)
+        self.face_helper.align_warp_face()
+        if len(self.face_helper.cropped_faces) == 0:
+            raise RuntimeError('facexlib align face fail')
+        align_face = self.face_helper.cropped_faces[0]
+        # incase insightface didn't detect face
+        if id_ante_embedding is None:
+            print('fail to detect face using insightface, extract embedding on align face')
+            id_ante_embedding = self.handler_ante.get_feat(align_face)
 
-            example_inps = [
-                [
-                    'portrait, impressionist painting, loose brushwork, vibrant color, light and shadow play',
-                    'example_inputs/zcy.webp',
-                    'fidelity',
-                ]
-            ]
-            gr.Examples(examples=example_inps, inputs=[prompt, face_image, mode], label='painting style')
+        id_ante_embedding = torch.from_numpy(id_ante_embedding).to(self.device)
+        if id_ante_embedding.ndim == 1:
+            id_ante_embedding = id_ante_embedding.unsqueeze(0)
 
-            example_inps = [
-                [
-                    'portrait, flat papercut style, silhouette, clean cuts, paper, sharp edges, minimalist,color block,man',  # noqa E501
-                    'example_inputs/lecun.jpg',
-                    'fidelity',
-                ]
-            ]
-            gr.Examples(examples=example_inps, inputs=[prompt, face_image, mode], label='papercut style')
+        # parsing
+        input = img2tensor(align_face, bgr2rgb=True).unsqueeze(0) / 255.0
+        input = input.to(self.device)
+        parsing_out = self.face_helper.face_parse(normalize(input, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))[0]
+        parsing_out = parsing_out.argmax(dim=1, keepdim=True)
+        bg_label = [0, 16, 18, 7, 8, 9, 14, 15]
+        bg = sum(parsing_out == i for i in bg_label).bool()
+        white_image = torch.ones_like(input)
+        # only keep the face features
+        face_features_image = torch.where(bg, white_image, self.to_gray(input))
+        self.debug_img_list.append(tensor2img(face_features_image, rgb2bgr=False))
 
-            example_inps = [
-                [
-                    'woman,cartoon,solo,Popmart Blind Box, Super Mario, 3d',
-                    'example_inputs/rihanna.webp',
-                    'fidelity',
-                ]
-            ]
-            gr.Examples(examples=example_inps, inputs=[prompt, face_image, mode], label='3d style')
+        # transform img before sending to eva-clip-vit
+        face_features_image = resize(face_features_image, self.clip_vision_model.image_size, InterpolationMode.BICUBIC)
+        face_features_image = normalize(face_features_image, self.eva_transform_mean, self.eva_transform_std)
+        id_cond_vit, id_vit_hidden = self.clip_vision_model(
+            face_features_image, return_all_features=False, return_hidden=True, shuffle=False
+        )
+        id_cond_vit_norm = torch.norm(id_cond_vit, 2, 1, True)
+        id_cond_vit = torch.div(id_cond_vit, id_cond_vit_norm)
 
-            example_inps = [
-                [
-                    'portrait, the legend of zelda, anime',
-                    'example_inputs/liuyifei.png',
-                    'extremely style',
-                ]
-            ]
-            gr.Examples(examples=example_inps, inputs=[prompt, face_image, mode], label='anime style')
+        id_cond = torch.cat([id_ante_embedding, id_cond_vit], dim=-1)
+        id_uncond = torch.zeros_like(id_cond)
+        id_vit_hidden_uncond = []
+        for layer_idx in range(0, len(id_vit_hidden)):
+            id_vit_hidden_uncond.append(torch.zeros_like(id_vit_hidden[layer_idx]))
 
-            example_inps = [
-                [
-                    'portrait, superman',
-                    'example_inputs/lecun.jpg',
-                    'example_inputs/lifeifei.jpg',
-                    'fidelity',
-                    True,
-                ]
-            ]
-            gr.Examples(examples=example_inps, inputs=[prompt, face_image, supp_image1, mode, id_mix], label='id mix')
+        id_embedding = self.id_adapter(id_cond, id_vit_hidden)
+        uncond_id_embedding = self.id_adapter(id_uncond, id_vit_hidden_uncond)
 
-        with gr.Column():
-            output = gr.Gallery(label='Output', elem_id="gallery")
-            intermediate_output = gr.Gallery(label='DebugImage', elem_id="gallery", visible=False)
-            gr.Markdown(_CITE_)
+        # return id_embedding
+        return torch.cat((uncond_id_embedding, id_embedding), dim=0)
 
-    inps = [
-        face_image,
-        supp_image1,
-        supp_image2,
-        supp_image3,
-        prompt,
-        neg_prompt,
-        scale,
-        n_samples,
-        seed,
-        steps,
-        H,
-        W,
-        id_scale,
-        mode,
-        id_mix,
-    ]
-    submit.click(fn=run, inputs=inps, outputs=[output, intermediate_output])
+    def inference(self, prompt, size, prompt_n='', image_embedding=None, id_scale=1.0, guidance_scale=1.2, steps=4):
+        images = self.pipe(
+            prompt=prompt,
+            negative_prompt=prompt_n,
+            num_images_per_prompt=size[0],
+            height=size[1],
+            width=size[2],
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            cross_attention_kwargs={'id_embedding': image_embedding, 'id_scale': id_scale},
+        ).images
 
-
-demo.queue(max_size=3)
-demo.launch(server_name='0.0.0.0')
+        return images
