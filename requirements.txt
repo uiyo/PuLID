@@ -1,8 +1,8 @@
 torch==2.0.1
 torchvision==0.15.2
-diffusers==0.25.0
+diffusers==0.30.3
 transformers==4.43.3
-gradio>=4.0.0
+gradio>4.19.0
 opencv-python
 httpx==0.23.3
 timm
@@ -15,3 +15,4 @@ onnxruntime-gpu
 accelerate
 SentencePiece
 safetensors
+peft
